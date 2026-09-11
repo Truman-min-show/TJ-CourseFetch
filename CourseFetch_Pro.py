@@ -40,10 +40,10 @@ from pprint import pprint
 #     在搜索到的课程信息中, 找到 "teachClassId" 字段, 复制它的值 (是一长串以1111...开头的数字)。
 #     为您想抢的每一门课都重复此操作。（注意同一门课的不同时间段有不同的teachClassId,请对照您要抢的时间段的课程序号与teachClassCode字段的值是否对应）
 #
-#   [研究生可选]
+#   [研究生：多课必填，单课建议填写]
 #   研究生课程的 teachClassId 可以在 F12 -> Network 中的 "getData" 请求的响应里找到。
-#   由于研究生模式下每对凭证已经和具体课程一一绑定, 通常无需填写;
-#   但如果并发抢多门课, 建议填写(见 ToDo 4), 以便脚本精确判断是哪门课抢到了,
+#   由于研究生模式下每对凭证已经和具体课程一一绑定, 单课可以不填，多课必须填写;
+#   如果并发抢多门课, 必须填写(见 ToDo 4), 以便脚本精确判断是哪门课抢到了,
 #   避免一个线程把别的线程的战果误认成自己的。
 #
 # ================================ 用户配置区域 (请将抓取的值填入下方) ================================
@@ -67,13 +67,14 @@ targetCourseIds = []
 
 # ToDo 4: 为每一门想抢的课程填写一组 (课程备注, ciphertext, checkCode)
 # 研究生选课系统一次只能保存一门课, 因此每门课需要单独抓包获取一对凭证。
-# 第4个元素 teachClassId 为【可选】(用于精确判断该门课是否抢到, 可在 getData 请求响应中找到):
-#   - 不填: 脚本检测到选课成功即认为本线程目标课程抢到;
-#   - 填写: 仅当成功课程与该 teachClassId 匹配时才退出, 并发抢多门课时推荐填写。
+# 第4个元素 teachClassId 为【多课必填，单课可选】(用于精确判断该门课是否抢到, 可在 getData 请求响应中找到):
+#   - 不填: 仅限单课兼容模式，无法按目标 ID 核验成功记录;
+#   - 填写: 仅当成功课程与该 teachClassId 匹配时才退出, 并发抢多门课时必须填写。
 # 例如:
+# 以下教学班 ID 仅为格式示例，请替换成各自课程的真实 ID。
 # grad_requests = [
-#     ("机器学习", "在这里替换成课程1的ciphertext", "在这里替换成课程1的checkCode"),
-#     ("中国马克思主义与当代", "在这里替换成课程2的ciphertext", "在这里替换成课程2的checkCode", 1111111124957260),
+#     ("机器学习", "在这里替换成课程1的ciphertext", "在这里替换成课程1的checkCode", 1111111124000001),
+#     ("中国马克思主义与当代", "在这里替换成课程2的ciphertext", "在这里替换成课程2的checkCode", 1111111124000002),
 # ]
 grad_requests = []
 
@@ -183,6 +184,37 @@ def run_undergraduate():
 
 # ================================ 研究生模式 ================================
 
+def normalize_grad_requests(entries):
+    """在任何网络请求之前校验并规范化配置。多课必须能够按 ID 归属结果。"""
+    normalized = []
+    labels, ids = set(), set()
+    if not entries:
+        raise ValueError("研究生目标课程列表为空。")
+    for entry in entries:
+        if not isinstance(entry, (list, tuple)) or len(entry) not in (3, 4):
+            raise ValueError("每门课须填写 (备注, ciphertext, checkCode[, teachClassId])。")
+        label, ct, cc = entry[:3]
+        if not all(isinstance(v, str) and v.strip() for v in (label, ct, cc)):
+            raise ValueError("课程备注与凭证不能为空。")
+        if label in labels:
+            raise ValueError("课程备注不能重复，请为不同教学班设置不同备注。")
+        labels.add(label)
+        value = entry[3] if len(entry) == 4 else None
+        if value is None or (isinstance(value, str) and not value.strip()):
+            if len(entries) > 1:
+                raise ValueError("研究生同时选多门课时，每门课都必须填写 teachClassId；否则无法区分共享查询结果。")
+            normalized.append((label, ct, cc))
+            continue
+        if isinstance(value, bool) or not isinstance(value, (str, int)) or not str(value).strip().isdigit() or int(value) <= 0:
+            raise ValueError("teachClassId 必须是正整数或仅含数字的字符串。")
+        teach_id = int(value)
+        if teach_id in ids:
+            raise ValueError("teachClassId 重复，请检查是否为同一个教学班配置了多个任务。")
+        ids.add(teach_id)
+        normalized.append((label, ct, cc, teach_id))
+    return normalized
+
+
 def grad_worker(entry, success_set, lock, stop_event):
     """一个线程 = 一个模拟的"网页", 负责抢一门课, 抢到后自动退出。
 
@@ -190,7 +222,7 @@ def grad_worker(entry, success_set, lock, stop_event):
     """
     label = entry[0]
     ciphertext, checkCode = entry[1], entry[2]
-    teach_id = entry[3] if len(entry) >= 4 else None
+    teach_id = int(entry[3]) if len(entry) >= 4 and entry[3] is not None else None
     tag = f"[{label}]"
 
     session = requests.Session()
@@ -214,6 +246,11 @@ def grad_worker(entry, success_set, lock, stop_event):
             time.sleep(interval)
 
             rs = session.post(statusUrl)
+            if rs.text == SESSION_NOT_EXIST:
+                with lock:
+                    print(f"{tag} 查询时会话已失效，请重新获取 X-Token。")
+                stop_event.set()
+                return
             status_data = rs.json()
             data = (status_data or {}).get("data") or {}
             successes = data.get("successCourses") or []
@@ -225,34 +262,23 @@ def grad_worker(entry, success_set, lock, stop_event):
                     pprint(failures)
 
             # ---- 判断本线程的目标课程是否抢到 ----
-            if successes:
+            if successes and data.get("status") == "Ready":
                 if teach_id is not None:
                     if teach_id in extract_success_ids(successes):
                         with lock:
                             print(f"{tag} 恭喜! 目标课程选课成功!")
                             pprint(successes)
-                        success_set.add(label)
+                        with lock:
+                            success_set.add(label)
                         return
                     # 成功的是别的线程的课, 本线程继续努力
                 else:
-                    # 未填 teachClassId, 无法区分是谁的战果, 默认视为本线程成功。
-                    # 并发抢多门课时可能出现误判提前退出, 建议填写 teachClassId 以精确判断。
+                    # 仅允许单课兼容模式；多课缺少 ID 已由启动校验拒绝。
                     with lock:
-                        print(f"{tag} 检测到选课成功, 视为本线程目标课程已抢到!")
-                        print(f"{tag} (并发抢多门课时如需精确判断, 请为每门课填写可选的 teachClassId)")
+                        print(f"{tag} 单课兼容模式：检测到成功记录，尚未按目标 ID 核验，请到网页确认。")
                         pprint(successes)
-                    success_set.add(label)
-                    return
-
-            # 第二重保险: 未填 teachClassId 时, 若失败原因提示"已选/已修/重复",
-            # 说明这门课已经选上了, 本线程退出。
-            if teach_id is None and failures:
-                ftxt = json.dumps(failures, ensure_ascii=False)
-                if any(k in ftxt for k in ("已选", "已修", "重复", "已经选")):
                     with lock:
-                        print(f"{tag} 检测到失败原因包含'已选'类提示, 推断该课程已选上, 本线程退出。")
-                        print(f"{tag} 失败详情: {ftxt}")
-                    success_set.add(label)
+                        success_set.add(label)
                     return
 
         except requests.exceptions.RequestException as e:
@@ -269,17 +295,24 @@ def grad_worker(entry, success_set, lock, stop_event):
 
 
 def run_graduate():
+    try:
+        entries = normalize_grad_requests(grad_requests)
+    except ValueError as e:
+        print(f"配置错误：{e}")
+        return
+    if len(entries[0]) == 3:
+        print("提示：单课未填 teachClassId，只能使用兼容判断；建议填写 ID，并避免同时在网页提交其他课程。")
     success_set = set()
     lock = threading.Lock()
     stop_event = threading.Event()
 
     print(f"研究生模式: 共 {len(grad_requests)} 门课, 将并发抢课 (模拟同时打开 {len(grad_requests)} 个选课页面)...")
-    for entry in grad_requests:
+    for entry in entries:
         print(f"  - {entry[0]}")
     print(f"抢课间隔时间： {interval} 秒...")
 
     threads = []
-    for entry in grad_requests:
+    for entry in entries:
         t = threading.Thread(target=grad_worker, args=(entry, success_set, lock, stop_event), daemon=True)
         threads.append(t)
     for t in threads:
@@ -296,8 +329,8 @@ def run_graduate():
 
     print("\n+===================================================================================+")
     print(" 脚本结束, 抢课结果汇总:")
-    for entry in grad_requests:
-        status = "已选上" if entry[0] in success_set else "未成功"
+    for entry in entries:
+        status = ("已选上" if len(entry) == 4 else "检测到成功记录（未按目标ID核验）") if entry[0] in success_set else "未成功"
         print(f"  - {entry[0]}: {status}")
     print("未成功的课程下次运行脚本时会继续尝试 (已选上的课系统会提示已选)。")
 
